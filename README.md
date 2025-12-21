@@ -5,21 +5,21 @@ It exposes a REST API used by a Flutter application (Web, Android, Windows, iOS)
 
 ---
 
-## Project Structure
+### Structure Explanation (Brief)
 
-Q-CYO_PYTHON_PROJECT/
-├── api/app.py                 # Flask API entry point
-├── data/                      # Crop yield datasets
-├── engine/                    # Recommendation engine
-├── models/                    # ML, weather risk, optimizer
-├── saved_models/              # Trained model (.pkl)
-├── utils/                     # Data preprocessing
-├── train_model.py             # Train ML model
-├── main.py                    # CLI testing
-├── requirements.txt
-└── README.md
+- **api/** – Exposes the REST API used by Flutter  
+- **data/** – Raw and processed datasets  
+- **engine/** – Combines ML, optimization, and rules  
+- **models/** – Prediction, risk analysis, optimization logic  
+- **saved_models/** – Stored trained models  
+- **utils/** – Data loading and preprocessing  
+- **train_model.py** – Trains the ML model  
+- **main.py** – Local CLI testing  
+- **requirements.txt** – Dependencies  
 
 ---
+
+
 
 ## Setup
 
