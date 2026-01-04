@@ -1,77 +1,490 @@
-﻿from flask import Flask, request, jsonify
+
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import sys
 import os
+import logging
+from datetime import datetime
 
-# Add parent directory to path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-parent_dir = os.path.dirname(current_dir)
-if parent_dir not in sys.path:
-    sys.path.append(parent_dir)
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine.recommendation_engine import RecommendationEngine
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS
+CORS(app)
 
-# Create engine instance
-recommendation_engine = RecommendationEngine()
+# In-memory cache for performance
+recommendation_cache = {}
+MAX_CACHE_SIZE = 100
+
+# Request counter for metrics
+request_counter = {
+    'total': 0,
+    'advanced': 0,
+    'simple': 0,
+    'errors': 0
+}
+
+# Validator for input parameters
+class InputValidator:
+    @staticmethod
+    def validate_rainfall(value):
+        try:
+            val = float(value)
+            if val < 0 or val > 1000:
+                return False, 'Rainfall must be between 0 and 1000 mm'
+            return True, val
+        except:
+            return False, 'Rainfall must be a number'
+    
+    @staticmethod
+    def validate_temperature(value):
+        try:
+            val = float(value)
+            if val < -20 or val > 50:
+                return False, 'Temperature must be between -20°C and 50°C'
+            return True, val
+        except:
+            return False, 'Temperature must be a number'
+    
+    @staticmethod
+    def validate_soil_type(value):
+        valid_soils = ['sandy', 'loam', 'clay', 'silty', 'peaty', 'chalky']
+        if value.lower() in valid_soils:
+            return True, value.lower()
+        return False, f'Soil type must be one of: {", ".join(valid_soils)}'
+    
+    @staticmethod
+    def validate_crop_type(value):
+        valid_crops = ['maize', 'wheat', 'rice', 'barley', 'soybean', 'sorghum']
+        if value.lower() in valid_crops:
+            return True, value.lower()
+        return False, f'Crop type must be one of: {", ".join(valid_crops)}'
+    
+    @staticmethod
+    def validate_area(value):
+        try:
+            val = float(value)
+            if val <= 0 or val > 10000:
+                return False, 'Area must be between 0.1 and 10,000 hectares'
+            return True, val
+        except:
+            return False, 'Area must be a number'
+
+def validate_input(data, required_fields):
+    errors = []
+    validated = {}
+    
+    for field, validator in required_fields.items():
+        if field not in data:
+            errors.append(f'Missing field: {field}')
+            continue
+            
+        is_valid, result = validator(data[field])
+        if is_valid:
+            validated[field] = result
+        else:
+            errors.append(f'{field}: {result}')
+    
+    return len(errors) == 0, validated, errors
+
+def get_cache_key(params):
+    return f'{params.get("rainfall")}_{params.get("temperature")}_{params.get("soil_type")}_{params.get("crop_type")}_{params.get("area")}'
+
+def cleanup_cache():
+    global recommendation_cache
+    if len(recommendation_cache) > MAX_CACHE_SIZE:
+        keys_to_remove = list(recommendation_cache.keys())[:MAX_CACHE_SIZE // 2]
+        for key in keys_to_remove:
+            del recommendation_cache[key]
+        logger.info(f'Cleaned up {len(keys_to_remove)} cache entries')
 
 @app.route('/recommend', methods=['POST'])
 def recommend():
+    request_counter['total'] += 1
+    
     try:
-        # Get JSON data from request
         data = request.get_json()
+        if not data:
+            request_counter['errors'] += 1
+            return jsonify({
+                'error': 'No JSON data provided',
+                'status': 'error'
+            }), 400
         
-        # Extract parameters with defaults
-        rainfall = data.get('rainfall', 120)
-        temperature = data.get('temperature', 26)
-        soil_type = data.get('soil_type', 'sandy')
-        crop_type = data.get('crop_type', 'maize')
-        area = data.get('area', 5)
+        required_fields = {
+            'rainfall': InputValidator.validate_rainfall,
+            'temperature': InputValidator.validate_temperature,
+            'soil_type': InputValidator.validate_soil_type,
+            'crop_type': InputValidator.validate_crop_type,
+            'area': InputValidator.validate_area
+        }
         
-        # Get recommendation
-        result = recommendation_engine.get_recommendation(
-            rainfall=rainfall,
-            temperature=temperature,
-            soil_type=soil_type,
-            crop_type=crop_type,
-            area=area
+        is_valid, validated_data, errors = validate_input(data, required_fields)
+        if not is_valid:
+            request_counter['errors'] += 1
+            return jsonify({
+                'error': 'Validation failed',
+                'details': errors,
+                'status': 'error'
+            }), 400
+        
+        cache_key = get_cache_key(validated_data)
+        if cache_key in recommendation_cache:
+            logger.info(f'Cache hit for key: {cache_key}')
+            result = recommendation_cache[cache_key]
+            result['cached'] = True
+            result['timestamp'] = datetime.now().isoformat()
+            return jsonify(result)
+        
+        engine = RecommendationEngine(use_advanced_fertilizer=True)
+        result = engine.get_recommendation(
+            validated_data['rainfall'],
+            validated_data['temperature'],
+            validated_data['soil_type'],
+            validated_data['crop_type'],
+            validated_data['area']
         )
+        
+        result['timestamp'] = datetime.now().isoformat()
+        result['request_id'] = f'req_{request_counter["total"]}'
+        result['cached'] = False
+        
+        recommendation_cache[cache_key] = result
+        cleanup_cache()
+        
+        logger.info(f'Recommendation generated for {validated_data["crop_type"]} on {validated_data["area"]}ha')
         
         return jsonify(result)
         
     except Exception as e:
+        request_counter['errors'] += 1
+        logger.error(f'Error in /recommend: {str(e)}', exc_info=True)
+        return jsonify({
+            'error': 'Internal server error',
+            'message': str(e),
+            'status': 'error'
+        }), 500
+
+@app.route('/recommend/advanced', methods=['POST'])
+def recommend_advanced():
+    request_counter['total'] += 1
+    request_counter['advanced'] += 1
+    
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data provided', 'status': 'error'}), 400
+        
+        r = float(data.get('rainfall', 120))
+        t = float(data.get('temperature', 26))
+        s = data.get('soil_type', 'sandy').lower()
+        c = data.get('crop_type', 'maize').lower()
+        a = float(data.get('area', 5))
+        
+        if a <= 0:
+            return jsonify({'error': 'Area must be positive', 'status': 'error'}), 400
+        
+        engine = RecommendationEngine(use_advanced_fertilizer=True)
+        result = engine.get_recommendation(r, t, s, c, a)
+        
+        result['endpoint'] = 'advanced'
+        result['fertilizer_algorithm'] = 'quantum-inspired'
+        result['timestamp'] = datetime.now().isoformat()
+        
+        logger.info(f'Advanced recommendation for {c} (Area: {a}ha, Rainfall: {r}mm)')
+        
+        return jsonify(result)
+        
+    except ValueError as e:
+        request_counter['errors'] += 1
+        return jsonify({
+            'error': 'Invalid parameter type',
+            'message': str(e),
+            'status': 'error'
+        }), 400
+    except Exception as e:
+        request_counter['errors'] += 1
+        logger.error(f'Error in /recommend/advanced: {str(e)}')
+        return jsonify({
+            'error': 'Internal server error',
+            'status': 'error'
+        }), 500
+
+@app.route('/recommend/simple', methods=['POST'])
+def recommend_simple():
+    request_counter['total'] += 1
+    request_counter['simple'] += 1
+    
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No JSON data provided', 'status': 'error'}), 400
+        
+        r = float(data.get('rainfall', 120))
+        t = float(data.get('temperature', 26))
+        s = data.get('soil_type', 'sandy').lower()
+        c = data.get('crop_type', 'maize').lower()
+        a = float(data.get('area', 5))
+        
+        engine = RecommendationEngine(use_advanced_fertilizer=False)
+        result = engine.get_recommendation(r, t, s, c, a)
+        
+        result['endpoint'] = 'simple'
+        result['fertilizer_algorithm'] = 'linear-formula'
+        result['timestamp'] = datetime.now().isoformat()
+        result['note'] = 'Using simple formula for backward compatibility'
+        
+        logger.info(f'Simple recommendation for {c}')
+        
+        return jsonify(result)
+        
+    except Exception as e:
+        request_counter['errors'] += 1
+        logger.error(f'Error in /recommend/simple: {str(e)}')
         return jsonify({
             'error': 'Invalid request',
-            'message': str(e)
+            'message': str(e),
+            'status': 'error'
         }), 400
+
+@app.route('/recommend/batch', methods=['POST'])
+def recommend_batch():
+    request_counter['total'] += 1
+    
+    try:
+        data = request.get_json()
+        if not data or 'requests' not in data:
+            return jsonify({'error': 'No batch requests provided', 'status': 'error'}), 400
+        
+        requests = data.get('requests', [])
+        use_advanced = data.get('advanced', True)
+        
+        if not isinstance(requests, list) or len(requests) > 50:
+            return jsonify({
+                'error': 'Requests must be a list (max 50 items)',
+                'status': 'error'
+            }), 400
+        
+        results = []
+        engine = RecommendationEngine(use_advanced_fertilizer=use_advanced)
+        
+        for i, req in enumerate(requests):
+            try:
+                r = float(req.get('rainfall', 120))
+                t = float(req.get('temperature', 26))
+                s = req.get('soil_type', 'sandy').lower()
+                c = req.get('crop_type', 'maize').lower()
+                a = float(req.get('area', 5))
+                
+                result = engine.get_recommendation(r, t, s, c, a)
+                result['batch_index'] = i
+                result['input_parameters'] = req
+                results.append(result)
+                
+            except Exception as e:
+                results.append({
+                    'batch_index': i,
+                    'status': 'error',
+                    'error': str(e),
+                    'input_parameters': req
+                })
+        
+        return jsonify({
+            'status': 'success',
+            'total_requests': len(requests),
+            'successful': len([r for r in results if r.get('status') == 'success']),
+            'failed': len([r for r in results if r.get('status') != 'success']),
+            'results': results,
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        request_counter['errors'] += 1
+        logger.error(f'Error in /recommend/batch: {str(e)}')
+        return jsonify({
+            'error': 'Batch processing failed',
+            'message': str(e),
+            'status': 'error'
+        }), 500
 
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'healthy'})
+    from engine.recommendation_engine import RecommendationEngine
+    
+    engine = RecommendationEngine()
+    test_result = engine.get_recommendation(120, 26, 'sandy', 'maize', 1.0)
+    
+    health_status = {
+        'status': 'healthy' if test_result.get('status') == 'success' else 'degraded',
+        'timestamp': datetime.now().isoformat(),
+        'service': 'Q-CYO Backend',
+        'version': '1.0.0',
+        'engine_status': test_result.get('status', 'unknown'),
+        'ml_model_available': test_result.get('ml_model_available', False),
+        'requests_processed': request_counter['total'],
+        'cache_size': len(recommendation_cache),
+        'memory_usage': f'{len(recommendation_cache) * 0.5:.1f}KB (estimated)'
+    }
+    
+    return jsonify(health_status)
+
+@app.route('/metrics', methods=['GET'])
+def metrics():
+    total = request_counter['total']
+    errors = request_counter['errors']
+    success_rate = ((total - errors) / total * 100) if total > 0 else 0
+    
+    return jsonify({
+        'status': 'success',
+        'metrics': {
+            'requests_total': total,
+            'requests_advanced': request_counter['advanced'],
+            'requests_simple': request_counter['simple'],
+            'errors_total': errors,
+            'success_rate': f'{success_rate:.1f}%',
+            'cache_hits': len([v for v in recommendation_cache.values() if v.get('cached', False)]),
+            'cache_size': len(recommendation_cache)
+        },
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/clear-cache', methods=['POST'])
+def clear_cache():
+    global recommendation_cache
+    cache_size = len(recommendation_cache)
+    recommendation_cache = {}
+    
+    logger.info(f'Cache cleared (was {cache_size} entries)')
+    
+    return jsonify({
+        'status': 'success',
+        'message': f'Cache cleared ({cache_size} entries removed)',
+        'timestamp': datetime.now().isoformat()
+    })
+
+@app.route('/validate-input', methods=['POST'])
+def validate_input_endpoint():
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({'error': 'No data provided', 'status': 'error'}), 400
+        
+        required_fields = {
+            'rainfall': InputValidator.validate_rainfall,
+            'temperature': InputValidator.validate_temperature,
+            'soil_type': InputValidator.validate_soil_type,
+            'crop_type': InputValidator.validate_crop_type,
+            'area': InputValidator.validate_area
+        }
+        
+        is_valid, validated_data, errors = validate_input(data, required_fields)
+        
+        return jsonify({
+            'status': 'success' if is_valid else 'invalid',
+            'valid': is_valid,
+            'validated_data': validated_data if is_valid else None,
+            'errors': errors if not is_valid else [],
+            'timestamp': datetime.now().isoformat()
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'error': str(e)
+        }), 400
+
+@app.route('/supported', methods=['GET'])
+def supported():
+    return jsonify({
+        'status': 'success',
+        'supported_parameters': {
+            'soil_types': ['sandy', 'loam', 'clay', 'silty', 'peaty', 'chalky'],
+            'crop_types': ['maize', 'wheat', 'rice', 'barley', 'soybean', 'sorghum'],
+            'rainfall_range': {'min': 0, 'max': 1000, 'unit': 'mm'},
+            'temperature_range': {'min': -20, 'max': 50, 'unit': '°C'},
+            'area_range': {'min': 0.1, 'max': 10000, 'unit': 'hectares'}
+        },
+        'endpoints': {
+            '/recommend': 'Main endpoint (advanced fertilizer)',
+            '/recommend/advanced': 'Advanced quantum fertilizer',
+            '/recommend/simple': 'Simple formula (backward compatible)',
+            '/recommend/batch': 'Batch processing',
+            '/validate-input': 'Validate input without processing',
+            '/health': 'System health check',
+            '/metrics': 'API metrics',
+            '/supported': 'This endpoint'
+        }
+    })
 
 @app.route('/', methods=['GET'])
 def home():
     return jsonify({
         'app': 'Quantum Crop Yield Optimizer (Q-CYO)',
-        'version': '1.0',
-        'endpoint': '/recommend (POST)',
-        'parameters': {
-            'rainfall': 'Rainfall in mm (number)',
-            'temperature': 'Temperature in °C (number)',
-            'soil_type': 'Soil type: sandy, clay, loamy, silty',
-            'crop_type': 'Crop type: maize, wheat, rice, soybean, cotton, barley',
-            'area': 'Farm area in hectares (number)'
+        'version': '1.0.0',
+        'status': 'running',
+        'description': 'AI-powered crop yield prediction with quantum-inspired optimization',
+        'timestamp': datetime.now().isoformat(),
+        'endpoints': {
+            'GET': {
+                '/': 'This documentation',
+                '/health': 'Health check',
+                '/metrics': 'API metrics',
+                '/supported': 'Supported parameters',
+                '/clear-cache': 'Clear cache (POST)'
+            },
+            'POST': {
+                '/recommend': 'Get recommendation (default)',
+                '/recommend/advanced': 'Advanced quantum optimization',
+                '/recommend/simple': 'Simple formula',
+                '/recommend/batch': 'Batch processing',
+                '/validate-input': 'Validate input'
+            }
         },
-        'example': {
-            'rainfall': 120,
-            'temperature': 26,
-            'soil_type': 'sandy',
-            'crop_type': 'maize',
-            'area': 5
-        }
+        'example_request': {
+            'method': 'POST',
+            'url': '/recommend',
+            'headers': {'Content-Type': 'application/json'},
+            'body': {
+                'rainfall': 150,
+                'temperature': 28,
+                'soil_type': 'loam',
+                'crop_type': 'maize',
+                'area': 10.5
+            }
+        },
+        'quick_start': 'curl -X POST http://localhost:5000/recommend -H "Content-Type: application/json" -d \'{"rainfall":120,"temperature":26,"soil_type":"sandy","crop_type":"maize","area":5}\''
     })
 
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({
+        'error': 'Endpoint not found',
+        'message': 'Check the / endpoint for available endpoints',
+        'status': 'error'
+    }), 404
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return jsonify({
+        'error': 'Method not allowed',
+        'status': 'error'
+    }), 405
+
 if __name__ == '__main__':
+    print('\n' + '='*60)
+    print('🚀 QUANTUM CROP YIELD OPTIMIZER API')
+    print('='*60)
+    print('📡 Starting server on http://0.0.0.0:5000')
+    print('📚 API Documentation: http://localhost:5000')
+    print('🏥 Health check: http://localhost:5000/health')
+    print('='*60 + '\n')
+    
     app.run(host='0.0.0.0', port=5000, debug=True)
