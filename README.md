@@ -166,3 +166,4 @@ Q_CYO_FLUTTER_APP/
 │
 ├── pubspec.yaml                  # Flutter dependencies
 └── README.md                     # Project documentation
+
